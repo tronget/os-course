@@ -4,6 +4,10 @@ Repository for the ITMO CSE OS course.
 
 ## Содержание
 
-- [ЛР: Файловая система](./lab/vtfs/README.md)
+- [БЛР1: Shell](./lab/vtsh/README.md)
+
+- [БЛР2: Page Cache](./lab/vtpc/README.md)
+
+- [ПЛР: Файловая система](./lab/vtfs/README.md)
 
 - [Порядок прохождения Code Review](./doc/code-review.md)
