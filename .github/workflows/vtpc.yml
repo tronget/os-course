@@ -1,4 +1,4 @@
-name: Test VT Shell
+name: Test VT Page Cache
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
   pull_request:
     paths:
-      - 'lab/vtsh/**'
+      - 'lab/vtpc/**'
 
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
       image: silkeh/clang:latest
     defaults:
       run:
-        working-directory: ./lab/vtsh
+        working-directory: ./lab/vtpc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,6 +44,11 @@ jobs:
             \( -iname '*.c' -o -iname '*.h' -o -iname '*.cpp' -o -iname '*.hpp' \) -exec \
             clang-tidy -p ./build {} \;
 
-      - name: Test
-        working-directory: ./lab/vtsh/test
-        run: python3 -m unittest discover
+      - name: Test Basic
+        run: ./build/test/test_basic
+
+      - name: Test Sequential
+        run: ./build/test/test_seq
+
+      - name: Test Random
+        run: ./build/test/test_random
