@@ -28,7 +28,8 @@ enum {
   SHOW_ELAPSED_TIME = 0,     // set to 1 to show elapsed time for each command
   NULL_CHAR = '\0',
   NEWLINE_CHAR = '\n',
-  CARRIAGE_RETURN_CHAR = '\r'
+  CARRIAGE_RETURN_CHAR = '\r',
+  READWRITE_MODE = 0666
 };
 
 #define CD_COMMAND "cd"
@@ -51,11 +52,16 @@ static void timespec_diff(
   }
 }
 
-static void print_elapsed_time(
-    const struct timespec* t_start, const struct timespec* t_end
-) {
+static void print_elapsed_time(const struct timespec* t_start) {
+  struct timespec t_end;
+  if (clock_gettime(CLOCK_MONOTONIC, &t_end) == -1) {
+    perror("clock_gettime");
+    t_end.tv_sec = t_start->tv_sec;
+    t_end.tv_nsec = t_start->tv_nsec;
+  }
+
   struct timespec t_diff;
-  timespec_diff(t_start, t_end, &t_diff);
+  timespec_diff(t_start, &t_end, &t_diff);
   long seconds = t_diff.tv_sec;
   long usec = t_diff.tv_nsec / NSEC_PER_USEC;
   if (printf(ELAPSED_FMT, seconds, usec) < 0) {
@@ -235,13 +241,11 @@ static int execute_external_fds(char** argv, int in_fd, int out_fd) {
   pid_t pid = vfork();
   if (pid == -1) {
     perror("vfork");
-    // close fds in parent (they were opened here before calling this function)
     close_fds(in_fd, out_fd);
     return EXIT_FAILURE;
   }
 
   if (pid == 0) {
-    /* Child (vfork): perform dup2 for redirections, then exec */
     if (in_fd != -1) {
       if (dup2(in_fd, STDIN_FILENO) == -1) {
         int err = errno;
@@ -259,7 +263,7 @@ static int execute_external_fds(char** argv, int in_fd, int out_fd) {
       close(out_fd);
     }
     execvp(argv[0], argv);
-    int err = errno; /* async-signal-safe only */
+    int err = errno;
     _exit((unsigned char)(((unsigned int)err) &
                           (unsigned int)ERRNO_STATUS_MASK));
   }
@@ -286,173 +290,176 @@ static int execute_external_fds(char** argv, int in_fd, int out_fd) {
   }
 
   if (SHOW_ELAPSED_TIME) {
-    struct timespec t_end;
-    if (clock_gettime(CLOCK_MONOTONIC, &t_end) == -1) {
-      perror("clock_gettime");
-      t_end.tv_sec = t_start.tv_sec;
-      t_end.tv_nsec = t_start.tv_nsec;
-    }
-    print_elapsed_time(&t_start, &t_end);
+    print_elapsed_time(&t_start);
   }
 
-  /* close fds opened in parent to avoid leaks */
   close_fds(in_fd, out_fd);
 
   return return_code;
 }
 
-static int run_single_command(int argc, char** tokens, int* should_exit) {
-  char* argv[MAX_TOKENS + 1];
-  for (int i = 0; i < argc; ++i) {
-    argv[i] = tokens[i];
+static int handle_builtin_cd(int argc, char** argv) {
+  if (argc < 2) {
+    if (fprintf(stderr, "cd: missing operand\n") < 0) {
+      perror("fprintf");
+    }
+    return EXIT_FAILURE;
   }
-  argv[argc] = NULL;
+  if (argc > 2) {
+    if (fprintf(stderr, "cd: too many arguments\n") < 0) {
+      perror("fprintf");
+    }
+    return EXIT_FAILURE;
+  }
+  if (chdir(argv[1]) != 0) {
+    perror("cd");
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
+}
 
+static int handle_builtin_exit(
+    int* exit_code, int argc, char** argv, int* should_exit
+) {
+  *should_exit = 1;
+  if (argc > 1) {
+    *exit_code = parse_exit_status(argv[1]);
+  } else {
+    *exit_code = EXIT_SUCCESS;
+  }
+  return 1;
+}
+
+static int handle_builtin_command(
+    int argc, char** argv, int* should_exit, int* exit_code
+) {
   if (argc == 0) {
-    return EXIT_SUCCESS;
+    *exit_code = EXIT_SUCCESS;
+    return 1;
   }
 
   if (strcmp(argv[0], EXIT_COMMAND) == 0) {
-    *should_exit = 1;
-    if (argc > 1) {
-      return parse_exit_status(argv[1]);
-    }
-    return EXIT_SUCCESS;
+    return handle_builtin_exit(exit_code, argc, argv, should_exit);
   }
 
   if (strcmp(argv[0], CD_COMMAND) == 0) {
-    if (argc < 2) {
-      if (fprintf(stderr, "cd: missing operand\n") < 0) {
-        perror("fprintf");
-      }
-      return EXIT_FAILURE;
-    }
-    if (argc > 2) {
-      if (fprintf(stderr, "cd: too many arguments\n") < 0) {
-        perror("fprintf");
-      }
-      return EXIT_FAILURE;
-    }
-    if (chdir(argv[1]) != 0) {
-      perror("cd");
-      return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
+    *exit_code = handle_builtin_cd(argc, argv);
+    return 1;
   }
 
-  /* ---- Parse redirections from argv[] ----
-     Recognized forms:
-       ">" "filename"
-       "<" "filename"
-       ">filename"
-       "<filename"
-     We treat ">>" or ">>filename" as syntax error (append not supported).
-     If syntax error detected, print "Syntax error\n" and return.
-     If opening file(s) fails, print "I/O error\n" and return.
-  */
-  char* in_file = NULL;
-  char* out_file = NULL;
+  return 0;  // Not a builtin command
+}
+
+static int handle_single_redirection(
+    int* i_ptr,
+    char** argv,
+    int argc,
+    int* skip_mask,
+    char** in_file,
+    char** out_file,
+    int* seen_in,
+    int* seen_out
+) {
+  char* token = argv[*i_ptr];
+
+  if ((token[0] == '>' && token[1] == '>') ||
+      (token[0] == '<' && token[1] == '<')) {
+    return -1;  // Syntax error for >> or <<
+  }
+
+  char** file_ptr = (token[0] == '>') ? out_file : in_file;
+  int* seen_ptr = (token[0] == '>') ? seen_out : seen_in;
+
+  if (*seen_ptr) {
+    return -1;  // Multiple redirections of the same type
+  }
+
+  if (token[1] != NULL_CHAR) {  // Form: >file or <file
+    *file_ptr = token + 1;
+    skip_mask[*i_ptr] = 1;
+  } else {  // Form: > file or < file
+    if (*i_ptr + 1 >= argc || argv[*i_ptr + 1][0] == '>' ||
+        argv[*i_ptr + 1][0] == '<') {
+      return -1;  // Syntax error
+    }
+    *file_ptr = argv[*i_ptr + 1];
+    skip_mask[*i_ptr] = 1;
+    skip_mask[*i_ptr + 1] = 1;
+    (*i_ptr)++;  // Skip next token
+  }
+  *seen_ptr = 1;
+  return 0;
+}
+
+static int parse_redirections(
+    char** argv, int argc, char** in_file, char** out_file, int* skip_mask
+) {
   int seen_in = 0;
   int seen_out = 0;
-  int syntax_err = 0;
-
-  /* mark tokens to skip when building exec argv */
-  int skip_mask[MAX_TOKENS] = {0};
 
   for (int i = 0; i < argc; ++i) {
     char* token = argv[i];
-    if (!token || token[0] == NULL_CHAR) {
-      continue;
-    }
     if (token[0] == '>' || token[0] == '<') {
-      /* detect >> as error */
-      if (token[0] == '>' && token[1] == '>') {
-        syntax_err = 1;
-        break;
-      }
-      if (token[0] == '<' && token[1] == '<') {
-        /* here-doc not supported -> syntax error */
-        syntax_err = 1;
-        break;
-      }
-
-      if (token[1] != NULL_CHAR) {
-        /* form: >filename or <filename */
-        if (token[0] == '>') {
-          if (seen_out) {
-            syntax_err = 1;
-            break;
-          }
-          out_file = token + 1;
-          seen_out = 1;
-          skip_mask[i] = 1;
-        } else {
-          if (seen_in) {
-            syntax_err = 1;
-            break;
-          }
-          in_file = token + 1;
-          seen_in = 1;
-          skip_mask[i] = 1;
-        }
-      } else {
-        /* form: ">" or "<" - next token must be filename */
-        if (i + 1 >= argc) {
-          syntax_err = 1;
-          break;
-        }
-        char* next = argv[i + 1];
-        if (!next || next[0] == NULL_CHAR) {
-          syntax_err = 1;
-          break;
-        }
-        /* if next token starts with > or < => syntax error */
-        if (next[0] == '>' || next[0] == '<') {
-          syntax_err = 1;
-          break;
-        }
-        if (token[0] == '>') {
-          if (seen_out) {
-            syntax_err = 1;
-            break;
-          }
-          out_file = next;
-          seen_out = 1;
-        } else {
-          if (seen_in) {
-            syntax_err = 1;
-            break;
-          }
-          in_file = next;
-          seen_in = 1;
-        }
-        skip_mask[i] = 1;
-        skip_mask[i + 1] = 1;
-        i++; /* skip next as we've consumed it */
+      if (handle_single_redirection(
+              &i, argv, argc, skip_mask, in_file, out_file, &seen_in, &seen_out
+          ) != 0) {
+        return -1;
       }
     }
   }
+  return 0;
+}
 
-  if (syntax_err) {
+static int open_redirection_files(
+    char* in_file, int* in_fd, char* out_file, int* out_fd
+) {
+  *in_fd = -1;
+  *out_fd = -1;
+  if (in_file) {
+    *in_fd = open(in_file, O_RDONLY);
+    if (*in_fd == -1) {
+      if (printf("I/O error\n") < 0) {
+        perror("printf");
+      }
+      return EXIT_FAILURE;
+    }
+  }
+  if (out_file) {
+    *out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, READWRITE_MODE);
+    if (*out_fd == -1) {
+      if (*in_fd != -1) {
+        close(*in_fd);
+      }
+      if (printf("I/O error\n") < 0) {
+        perror("printf");
+      }
+      return EXIT_FAILURE;
+    }
+  }
+  return EXIT_SUCCESS;
+}
+
+static int run_external_command(int argc, char** argv) {
+  char* in_file = NULL;
+  char* out_file = NULL;
+  int skip_mask[MAX_TOKENS] = {0};
+
+  if (parse_redirections(argv, argc, &in_file, &out_file, skip_mask) != 0) {
     if (printf("Syntax error\n") < 0) {
       perror("printf");
     }
     return EXIT_FAILURE;
   }
 
-  /* Build argv_exec (without redirection tokens/filenames) */
   char* argv_exec[MAX_TOKENS + 1];
   int exec_idx = 0;
   for (int i = 0; i < argc; ++i) {
-    if (skip_mask[i]) {
-      continue;
+    if (!skip_mask[i]) {
+      argv_exec[exec_idx++] = argv[i];
     }
-    argv_exec[exec_idx++] = argv[i];
   }
   argv_exec[exec_idx] = NULL;
 
-  /* If no command remains (e.g., user typed only redirections), that's a syntax
-   * error */
   if (exec_idx == 0) {
     if (printf("Syntax error\n") < 0) {
       perror("printf");
@@ -460,35 +467,22 @@ static int run_single_command(int argc, char** tokens, int* should_exit) {
     return EXIT_FAILURE;
   }
 
-  /* Attempt to open files (in parent). If any open fails -> I/O error */
-  int in_fd = -1;
-  int out_fd = -1;
-  if (in_file) {
-    in_fd = open(in_file, O_RDONLY);
-    if (in_fd == -1) {
-      if (printf("I/O error\n") < 0) {
-        perror("printf");
-      }
-      /* ensure we don't leak an out_fd if already opened (not here yet) */
-      return EXIT_FAILURE;
-    }
-  }
-  if (out_file) {
-    out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (out_fd == -1) {
-      if (in_fd != -1) {
-        close(in_fd);
-      }
-      if (printf("I/O error\n") < 0) {
-        perror("printf");
-      }
-      return EXIT_FAILURE;
-    }
+  int in_fd = 0;
+  int out_fd = 0;
+  if (open_redirection_files(in_file, &in_fd, out_file, &out_fd) !=
+      EXIT_SUCCESS) {
+    return EXIT_FAILURE;
   }
 
-  /* Execute with fds; execute_external_fds will close in_fd/out_fd in parent
-   * after wait. */
   return execute_external_fds(argv_exec, in_fd, out_fd);
+}
+
+static int run_single_command(int argc, char** tokens, int* should_exit) {
+  int exit_code = 0;
+  if (handle_builtin_command(argc, tokens, should_exit, &exit_code)) {
+    return exit_code;
+  }
+  return run_external_command(argc, tokens);
 }
 
 static int execute_tokens(char** tokens, size_t count, int* should_exit) {
