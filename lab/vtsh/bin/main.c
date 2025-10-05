@@ -2,9 +2,11 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -23,7 +25,10 @@ enum {
   NSEC_PER_SEC = 1000000000L,
   NSEC_PER_USEC = 1000L,
   ERRNO_STATUS_MASK = 0xFF,  // mask errno to single byte
-  SHOW_ELAPSED_TIME = 0      // set to 1 to show elapsed time for each command
+  SHOW_ELAPSED_TIME = 0,     // set to 1 to show elapsed time for each command
+  NULL_CHAR = '\0',
+  NEWLINE_CHAR = '\n',
+  CARRIAGE_RETURN_CHAR = '\r'
 };
 
 #define CD_COMMAND "cd"
@@ -63,7 +68,7 @@ static int is_blank_line(const char* line) {
     return 1;
   }
   const unsigned char* ptr = (const unsigned char*)line;
-  while (*ptr != '\0') {
+  while (*ptr != NULL_CHAR) {
     if (!isspace(*ptr)) {
       return 0;
     }
@@ -97,7 +102,7 @@ static char* normalize_line(const char* line) {
   size_t out_idx = 0;
   for (size_t i = 0; i < len; ++i) {
     unsigned char current_char = (unsigned char)line[i];
-    if (current_char == '\n' || current_char == '\r') {
+    if (current_char == NEWLINE_CHAR || current_char == CARRIAGE_RETURN_CHAR) {
       continue;
     }
     if (current_char == '|' && i + 1 < len && line[i + 1] == '|') {
@@ -110,7 +115,7 @@ static char* normalize_line(const char* line) {
     }
     normalized[out_idx++] = (char)current_char;
   }
-  normalized[out_idx] = '\0';
+  normalized[out_idx] = NULL_CHAR;
   return normalized;
 }
 
@@ -188,7 +193,7 @@ static int parse_exit_status(const char* arg) {
   errno = 0;
   char* endptr = NULL;
   long value = strtol(arg, &endptr, RADIX_DECIMAL);
-  if (errno != 0 || endptr == arg || *endptr != '\0') {
+  if (errno != 0 || endptr == arg || *endptr != NULL_CHAR) {
     return EXIT_FAILURE;
   }
   if (value < 0) {
@@ -200,7 +205,22 @@ static int parse_exit_status(const char* arg) {
   return (int)value;
 }
 
-static int execute_external(char** argv) {
+static void close_fds(int in_fd, int out_fd) {
+  if (in_fd != -1) {
+    close(in_fd);
+  }
+  if (out_fd != -1) {
+    close(out_fd);
+  }
+}
+
+/*
+ * Execute external command with optional input/output file descriptors.
+ * in_fd/out_fd are file descriptors already opened in parent (or -1).
+ * This function will vfork, dup2 fds in the child, execvp, wait in parent,
+ * and close opened fds in parent after wait.
+ */
+static int execute_external_fds(char** argv, int in_fd, int out_fd) {
   if (!argv || !argv[0]) {
     return EXIT_FAILURE;
   }
@@ -213,13 +233,31 @@ static int execute_external(char** argv) {
   }
 
   pid_t pid = vfork();
-
   if (pid == -1) {
     perror("vfork");
+    // close fds in parent (they were opened here before calling this function)
+    close_fds(in_fd, out_fd);
     return EXIT_FAILURE;
   }
 
   if (pid == 0) {
+    /* Child (vfork): perform dup2 for redirections, then exec */
+    if (in_fd != -1) {
+      if (dup2(in_fd, STDIN_FILENO) == -1) {
+        int err = errno;
+        _exit((unsigned char)(((unsigned int)err) &
+                              (unsigned int)ERRNO_STATUS_MASK));
+      }
+      close(in_fd);
+    }
+    if (out_fd != -1) {
+      if (dup2(out_fd, STDOUT_FILENO) == -1) {
+        int err = errno;
+        _exit((unsigned char)(((unsigned int)err) &
+                              (unsigned int)ERRNO_STATUS_MASK));
+      }
+      close(out_fd);
+    }
     execvp(argv[0], argv);
     int err = errno; /* async-signal-safe only */
     _exit((unsigned char)(((unsigned int)err) &
@@ -256,6 +294,9 @@ static int execute_external(char** argv) {
     }
     print_elapsed_time(&t_start, &t_end);
   }
+
+  /* close fds opened in parent to avoid leaks */
+  close_fds(in_fd, out_fd);
 
   return return_code;
 }
@@ -299,7 +340,155 @@ static int run_single_command(int argc, char** tokens, int* should_exit) {
     return EXIT_SUCCESS;
   }
 
-  return execute_external(argv);
+  /* ---- Parse redirections from argv[] ----
+     Recognized forms:
+       ">" "filename"
+       "<" "filename"
+       ">filename"
+       "<filename"
+     We treat ">>" or ">>filename" as syntax error (append not supported).
+     If syntax error detected, print "Syntax error\n" and return.
+     If opening file(s) fails, print "I/O error\n" and return.
+  */
+  char* in_file = NULL;
+  char* out_file = NULL;
+  int seen_in = 0;
+  int seen_out = 0;
+  int syntax_err = 0;
+
+  /* mark tokens to skip when building exec argv */
+  int skip_mask[MAX_TOKENS] = {0};
+
+  for (int i = 0; i < argc; ++i) {
+    char* token = argv[i];
+    if (!token || token[0] == NULL_CHAR) {
+      continue;
+    }
+    if (token[0] == '>' || token[0] == '<') {
+      /* detect >> as error */
+      if (token[0] == '>' && token[1] == '>') {
+        syntax_err = 1;
+        break;
+      }
+      if (token[0] == '<' && token[1] == '<') {
+        /* here-doc not supported -> syntax error */
+        syntax_err = 1;
+        break;
+      }
+
+      if (token[1] != NULL_CHAR) {
+        /* form: >filename or <filename */
+        if (token[0] == '>') {
+          if (seen_out) {
+            syntax_err = 1;
+            break;
+          }
+          out_file = token + 1;
+          seen_out = 1;
+          skip_mask[i] = 1;
+        } else {
+          if (seen_in) {
+            syntax_err = 1;
+            break;
+          }
+          in_file = token + 1;
+          seen_in = 1;
+          skip_mask[i] = 1;
+        }
+      } else {
+        /* form: ">" or "<" - next token must be filename */
+        if (i + 1 >= argc) {
+          syntax_err = 1;
+          break;
+        }
+        char* next = argv[i + 1];
+        if (!next || next[0] == NULL_CHAR) {
+          syntax_err = 1;
+          break;
+        }
+        /* if next token starts with > or < => syntax error */
+        if (next[0] == '>' || next[0] == '<') {
+          syntax_err = 1;
+          break;
+        }
+        if (token[0] == '>') {
+          if (seen_out) {
+            syntax_err = 1;
+            break;
+          }
+          out_file = next;
+          seen_out = 1;
+        } else {
+          if (seen_in) {
+            syntax_err = 1;
+            break;
+          }
+          in_file = next;
+          seen_in = 1;
+        }
+        skip_mask[i] = 1;
+        skip_mask[i + 1] = 1;
+        i++; /* skip next as we've consumed it */
+      }
+    }
+  }
+
+  if (syntax_err) {
+    if (printf("Syntax error\n") < 0) {
+      perror("printf");
+    }
+    return EXIT_FAILURE;
+  }
+
+  /* Build argv_exec (without redirection tokens/filenames) */
+  char* argv_exec[MAX_TOKENS + 1];
+  int exec_idx = 0;
+  for (int i = 0; i < argc; ++i) {
+    if (skip_mask[i]) {
+      continue;
+    }
+    argv_exec[exec_idx++] = argv[i];
+  }
+  argv_exec[exec_idx] = NULL;
+
+  /* If no command remains (e.g., user typed only redirections), that's a syntax
+   * error */
+  if (exec_idx == 0) {
+    if (printf("Syntax error\n") < 0) {
+      perror("printf");
+    }
+    return EXIT_FAILURE;
+  }
+
+  /* Attempt to open files (in parent). If any open fails -> I/O error */
+  int in_fd = -1;
+  int out_fd = -1;
+  if (in_file) {
+    in_fd = open(in_file, O_RDONLY);
+    if (in_fd == -1) {
+      if (printf("I/O error\n") < 0) {
+        perror("printf");
+      }
+      /* ensure we don't leak an out_fd if already opened (not here yet) */
+      return EXIT_FAILURE;
+    }
+  }
+  if (out_file) {
+    out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out_fd == -1) {
+      if (in_fd != -1) {
+        close(in_fd);
+      }
+      if (printf("I/O error\n") < 0) {
+        perror("printf");
+      }
+      return EXIT_FAILURE;
+    }
+  }
+
+  /* Execute with fds; execute_external_fds will close in_fd/out_fd in parent
+   * after wait. */
+  return execute_external_fds(argv_exec, in_fd, out_fd);
 }
 
 static int execute_tokens(char** tokens, size_t count, int* should_exit) {
@@ -386,7 +575,7 @@ int main(void) {
     ssize_t len = getline(&line, &capacity, stdin);
     if (len == -1) {
       if (feof(stdin)) {
-        if (putchar('\n') == EOF) {
+        if (putchar(NEWLINE_CHAR) == EOF) {
           perror("putchar");
         }
       } else {
