@@ -8,3 +8,8 @@ build/
 __pycache__/
 
 .vscode/
+
+bin/profile_ioLoad_opt.data
+bin/profile_ioLoad_opt.txt
+bin/ioload
+bin/ioload_opt

@@ -24,8 +24,8 @@ enum {
   RADIX_DECIMAL = 10,
   NSEC_PER_SEC = 1000000000L,
   NSEC_PER_USEC = 1000L,
-  ERRNO_STATUS_MASK = 0xFF,  // mask errno to single byte
-  SHOW_ELAPSED_TIME = 0,     // set to 1 to show elapsed time for each command
+  ERRNO_STATUS_MASK = 0xFF,
+  SHOW_ELAPSED_TIME = 1,  // set to 1 to show elapsed time after each command
   NULL_CHAR = '\0',
   NEWLINE_CHAR = '\n',
   CARRIAGE_RETURN_CHAR = '\r',
@@ -220,12 +220,6 @@ static void close_fds(int in_fd, int out_fd) {
   }
 }
 
-/*
- * Execute external command with optional input/output file descriptors.
- * in_fd/out_fd are file descriptors already opened in parent (or -1).
- * This function will vfork, dup2 fds in the child, execvp, wait in parent,
- * and close opened fds in parent after wait.
- */
 static int execute_external_fds(char** argv, int in_fd, int out_fd) {
   if (!argv || !argv[0]) {
     return EXIT_FAILURE;
@@ -347,7 +341,7 @@ static int handle_builtin_command(
     return 1;
   }
 
-  return 0;  // Not a builtin command
+  return 0;
 }
 
 static int handle_single_redirection(
@@ -364,28 +358,28 @@ static int handle_single_redirection(
 
   if ((token[0] == '>' && token[1] == '>') ||
       (token[0] == '<' && token[1] == '<')) {
-    return -1;  // Syntax error for >> or <<
+    return -1;
   }
 
   char** file_ptr = (token[0] == '>') ? out_file : in_file;
   int* seen_ptr = (token[0] == '>') ? seen_out : seen_in;
 
   if (*seen_ptr) {
-    return -1;  // Multiple redirections of the same type
+    return -1;
   }
 
-  if (token[1] != NULL_CHAR) {  // Form: >file or <file
+  if (token[1] != NULL_CHAR) {
     *file_ptr = token + 1;
     skip_mask[*i_ptr] = 1;
-  } else {  // Form: > file or < file
+  } else {
     if (*i_ptr + 1 >= argc || argv[*i_ptr + 1][0] == '>' ||
         argv[*i_ptr + 1][0] == '<') {
-      return -1;  // Syntax error
+      return -1;
     }
     *file_ptr = argv[*i_ptr + 1];
     skip_mask[*i_ptr] = 1;
     skip_mask[*i_ptr + 1] = 1;
-    (*i_ptr)++;  // Skip next token
+    (*i_ptr)++;
   }
   *seen_ptr = 1;
   return 0;
