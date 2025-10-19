@@ -25,7 +25,7 @@ enum {
   NSEC_PER_SEC = 1000000000L,
   NSEC_PER_USEC = 1000L,
   ERRNO_STATUS_MASK = 0xFF,
-  SHOW_ELAPSED_TIME = 1,  // set to 1 to show elapsed time after each command
+  SHOW_ELAPSED_TIME = 0,  // set to 1 to show elapsed time after each command
   NULL_CHAR = '\0',
   NEWLINE_CHAR = '\n',
   CARRIAGE_RETURN_CHAR = '\r',
