@@ -83,11 +83,11 @@ typedef struct {
   uint64_t block_count;   // ОБЩЕЕ число I/O (на все потоки)
   const char* file_path;  // path
   off_t range_lo;         // inclusive, bytes
-  off_t range_hi;  // inclusive, bytes; 0-0 => весь файл (для чтения) или
-                   // [0..bc*bs) для записи
-  bool direct;  // bypass caches: macOS F_NOCACHE / Linux O_DIRECT
-  pick_t pick;  // sequence / random
-  int threads;  // кол-во потоков
+  off_t range_hi;         // inclusive, bytes; 0-0 => весь файл (для чтения) или
+                          // [0..bc*bs) для записи
+  bool direct;            // bypass caches: macOS F_NOCACHE / Linux O_DIRECT
+  pick_t pick;            // sequence / random
+  int threads;            // кол-во потоков
 } params_t;
 
 static void usage(const char* prog) {
@@ -429,7 +429,7 @@ static int do_ioload_mt(const params_t* p) {
     return -1;
 
   const size_t bs = p->block_size;
-  if (bs > (size_t)SSIZE_MAX) {
+  if (bs > (size_t)SIZE_MAX) {
     fprintf(stderr, "block_size too large for this platform\n");
     close(fd);
     return -1;

@@ -13,3 +13,6 @@ bin/profile_ioLoad_opt.data
 bin/profile_ioLoad_opt.txt
 bin/ioload
 bin/ioload_opt
+bin/ema_sort_int
+bin/cpu_calc_md5
+bin/ioload_mt
